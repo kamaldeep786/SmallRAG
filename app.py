@@ -9,7 +9,11 @@ import time
 import traceback
 import importlib
 
-st.set_page_config(page_title="Small RAG — Lazy Load (KB + Web fallback)", layout="wide")
+st.set_page_config(page_title="Small RAG — Lazy Load (KB + Gemini fallback)", layout="wide")
+
+# Local uploaded file path (available in this session)
+# Use this path (it will be transformed to a URL by your deployment/tooling if needed)
+FILE_URL = "/mnt/data/edf991c1-66d2-49aa-9bfc-f30bdcf212c6.png"
 
 # ---- Configuration / secrets ----
 API_KEY = st.secrets.get("GENAI_API_KEY", os.environ.get("GENAI_API_KEY"))
@@ -84,82 +88,73 @@ def retrieve(query, k=3):
     top_idx = np.argsort(sims)[-k:][::-1]
     return [(documents[i], float(sims[i])) for i in top_idx]
 
-# ---- web search via Gemini (defensive) ----
-def web_search_gemini(query, max_snippets=5):
-    if not API_KEY:
-        return "No API key configured - cannot perform web search."
-
-    try:
-        model = genai.GenerativeModel("gemini-2.0-flash", tools=[{"google_search": {}}])
-        response = model.generate_content(
-            [
-                {
-                    "google_search": {
-                        "q": query,
-                        "num_results": max_snippets
-                    }
-                }
-            ]
-        )
-        snippets = []
-        if hasattr(response, "candidates"):
-            for c in response.candidates:
-                if hasattr(c, "content") and getattr(c.content, "parts", None):
-                    for part in c.content.parts:
-                        text = getattr(part, "text", None)
-                        if text:
-                            snippets.append(text.strip())
-                else:
-                    snippets.append(str(c))
-        else:
-            snippets.append(str(response))
-
-        unique_snips = []
-        for s in snippets:
-            if s not in unique_snips and len(unique_snips) < max_snippets:
-                unique_snips.append(s)
-
-        return "\n\n".join(unique_snips).strip() or ("No web snippets found for: " + query)
-
-    except Exception as e:
-        return f"Web search failed: {e}\n\n{traceback.format_exc()}"
-
-# ---- RAG function ----
-def rag_answer(query, k=2, similarity_threshold=0.40, max_web_snippets=5):
+# ---- RAG function with Gemini direct fallback ----
+def rag_answer(query, k=2, similarity_threshold=0.40):
+    """
+    1) Retrieve from KB.
+    2) If top similarity >= threshold -> build facts from KB and ask Gemini to answer using only them.
+    3) If top similarity < threshold -> call Gemini directly (no KB facts) and let Gemini answer from its knowledge.
+    Returns: prompt_sent, answer_text, retrieved_list, mode_used
+             mode_used: "kb" | "gemini_fallback"
+    """
     try:
         retrieved = retrieve(query, k=k)
     except Exception as e:
         raise RuntimeError(f"Retrieval failed: {e}\n\n{traceback.format_exc()}")
 
     top_score = retrieved[0][1] if retrieved else 0.0
-    use_web = top_score < similarity_threshold
-    web_snippets = None
+    used_mode = "kb"
 
-    if not use_web:
+    # If KB match is good enough, use KB facts
+    if top_score >= similarity_threshold:
         facts = "\n".join([f"- {text}" for text, score in retrieved])
-    else:
-        web_snippets = web_search_gemini(query, max_snippets=max_web_snippets)
-        if web_snippets and not web_snippets.lower().startswith("web search failed"):
-            facts = "\n".join([f"- {line}" for line in web_snippets.splitlines() if line.strip()][:10])
-        else:
-            facts = f"- No factual snippets found for query: {query}"
-
-    prompt = f"""
-Answer the question using ONLY these facts (do NOT add external info you don't know):
+        prompt = f"""
+Answer the question using ONLY these facts (do NOT add external facts you can't verify):
 
 {facts}
 
 Question: {query}
 Answer briefly:
 """
+        # If no API key, return early
+        if not API_KEY:
+            return prompt, "No API key configured - cannot call Gemini.", retrieved, used_mode
 
+        try:
+            llm = genai.GenerativeModel("gemini-2.0-flash")
+            resp = llm.generate_content(prompt)
+            # robust extraction
+            text = getattr(resp, "text", None) or (resp.output_text if hasattr(resp, "output_text") else None)
+            if not text and hasattr(resp, "candidates"):
+                collected = []
+                for c in resp.candidates:
+                    if hasattr(c, "content") and getattr(c.content, "parts", None):
+                        for part in c.content.parts:
+                            t = getattr(part, "text", None)
+                            if t:
+                                collected.append(t)
+                text = "\n".join(collected)
+            if not text:
+                text = str(resp)
+            return prompt, text.strip(), retrieved, used_mode
+        except Exception as e:
+            return prompt, f"Error calling Gemini with KB facts: {e}\n\n{traceback.format_exc()}", retrieved, used_mode
+
+    # Otherwise, fallback: let Gemini answer freely (no KB facts)
+    used_mode = "gemini_fallback"
+    prompt = f"""
+You are a helpful assistant. Answer the question below briefly and clearly using your knowledge.
+If you are unsure, say you are unsure rather than inventing facts.
+
+Question: {query}
+Answer briefly:
+"""
     if not API_KEY:
-        return prompt, "No API key configured - cannot call Gemini.", retrieved, use_web, web_snippets
+        return prompt, "No API key configured - cannot call Gemini.", retrieved, used_mode
 
     try:
         llm = genai.GenerativeModel("gemini-2.0-flash")
         resp = llm.generate_content(prompt)
-
         text = getattr(resp, "text", None) or (resp.output_text if hasattr(resp, "output_text") else None)
         if not text and hasattr(resp, "candidates"):
             collected = []
@@ -172,21 +167,19 @@ Answer briefly:
             text = "\n".join(collected)
         if not text:
             text = str(resp)
-
-        answer_text = text.strip() if hasattr(text, "strip") else str(text)
-        return prompt, answer_text, retrieved, use_web, web_snippets
-
+        return prompt, text.strip(), retrieved, used_mode
     except Exception as e:
-        return prompt, f"Error calling Gemini: {e}\n\n{traceback.format_exc()}", retrieved, use_web, web_snippets
+        return prompt, f"Error calling Gemini (fallback): {e}\n\n{traceback.format_exc()}", retrieved, used_mode
 
 # ---- UI ----
-st.title("Small RAG demo — Streamlit + Gemini (lazy load)")
-st.markdown("App loads heavy ML model only when you click Ask. This helps avoid startup-time failures on hosts with strict time/memory limits.")
+st.title("Small RAG demo — Streamlit + Gemini (KB first, Gemini fallback)")
+st.markdown("This app searches a small in-memory KB first. If the top KB match is below the similarity threshold, Gemini will answer directly using its internal knowledge (no live web search).")
+
+st.markdown(f"**Uploaded file path available in app:** `{FILE_URL}`")
 
 query = st.text_input("Enter question", value="what is india?")
 k = st.slider("How many KB documents to retrieve (k)", min_value=1, max_value=5, value=2)
-similarity_threshold = st.slider("Similarity threshold", min_value=0.0, max_value=1.0, value=0.40, step=0.01)
-max_web_snippets = st.number_input("Max web snippets to fetch", min_value=1, max_value=10, value=5)
+similarity_threshold = st.slider("Similarity threshold (if top KB match >= threshold → use KB)", min_value=0.0, max_value=1.0, value=0.40, step=0.01)
 
 show_debug = st.sidebar.checkbox("Show debug logs", value=False)
 
@@ -203,54 +196,26 @@ if st.button("Ask"):
                     st.text(st.session_state.get("last_error"))
                 st.stop()
 
-    # Now perform RAG / web fallback
+    # Now perform RAG / gemini fallback
     try:
         with st.spinner("Retrieving and calling model..."):
             t0 = time.time()
-            prompt, answer, retrieved, used_web, web_snips = rag_answer(query, k=k, similarity_threshold=similarity_threshold, max_web_snippets=max_web_snippets)
+            prompt, answer, retrieved, mode_used = rag_answer(query, k=k, similarity_threshold=similarity_threshold)
             t1 = time.time()
     except Exception as e:
-        st.error("RAG processing failed. See debug info below.")
+        st.error("Processing failed. See debug info below.")
         if show_debug:
             st.text(traceback.format_exc())
         st.stop()
 
-    if used_web:
-        st.success("✔ Used Web Search (KB didn't return a confident match).")
+    if mode_used == "kb":
+        st.info("✔ Answered from Knowledge Base (KB facts were used).")
     else:
-        st.info("✔ Answered from Knowledge Base (no web search needed).")
+        st.success("✔ Gemini answered directly (KB had no confident match).")
 
     st.subheader("Timing")
     st.write(f"Total time: {t1 - t0:.2f}s")
 
     st.subheader("Retrieved facts (KB)")
     for doc, score in retrieved:
-        st.write(f"- ({score:.4f}) {doc}")
-
-    if used_web:
-        st.subheader("Web snippets (first results)")
-        st.write(web_snips)
-
-    st.subheader("Prompt sent to Gemini")
-    st.code(prompt, language="text")
-
-    st.subheader("Model answer")
-    st.write(answer)
-
-# Debug section (visible if checkbox)
-if show_debug:
-    st.markdown("### Debug info")
-    st.write("Models loaded:", st.session_state["models_loaded"])
-    st.write("API key present:", bool(API_KEY))
-    try:
-        import sys, pkgutil
-        st.write("Python version:", sys.version)
-        # Show a small list of installed top-level packages to identify install issues
-        pkgs = sorted([m.name for m in pkgutil.iter_modules()][:60])
-        st.write("Installed packages (sample):", pkgs[:40])
-    except Exception as e:
-        st.write("Could not enumerate installed packages:", e)
-
-st.sidebar.header("Notes")
-st.sidebar.write("If model loading fails with 'Killed' or OOM, your host may not have enough memory. Consider using a lighter embedder or precomputing embeddings.")
-st.sidebar.write("Do NOT commit your API key to GitHub. Use Streamlit Secrets or environment variables.")
+        st.write
