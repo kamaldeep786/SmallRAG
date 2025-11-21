@@ -1,0 +1,5 @@
+streamlit
+sentence-transformers
+numpy
+google-generativeai
+torch                # sentence-transformers depends on torch; include if not pulling as transitive
