@@ -205,7 +205,7 @@ Answer briefly (max {answer_sentences} sentences). If the facts don't contain th
 
         try:
             # Initialize Gemini model (fast, lightweight model).
-            llm = genai.GenerativeModel("gemini-2.0-flash")
+            llm = genai.GenerativeModel("gemini-1.5-flash")
             # Call the model with the constructed prompt.
             resp = llm.generate_content(prompt)
 
@@ -262,7 +262,7 @@ Answer briefly:
 
     try:
         # Same model as above, but without KB facts.
-        llm = genai.GenerativeModel("gemini-2.0-flash")
+        llm = genai.GenerativeModel("gemini-1.5-flash")
         resp = llm.generate_content(prompt)
 
         # Robust extraction logic for text.
